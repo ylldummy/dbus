@@ -238,14 +238,14 @@ func NewDefaultSignalHandler() *defaultSignalHandler {
 }
 
 type defaultSignalHandler struct {
-	mu      sync.RWMutex
+	mu      sync.Mutex
 	closed  bool
 	signals []*signalChannelData
 }
 
 func (sh *defaultSignalHandler) DeliverSignal(intf, name string, signal *Signal) {
-	sh.mu.RLock()
-	defer sh.mu.RUnlock()
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 	if sh.closed {
 		return
 	}
@@ -275,10 +275,7 @@ func (sh *defaultSignalHandler) AddSignal(ch chan<- *Signal) {
 	if sh.closed {
 		return
 	}
-	sh.signals = append(sh.signals, &signalChannelData{
-		ch:   ch,
-		done: make(chan struct{}),
-	})
+	sh.signals = append(sh.signals, newSignalChannelData(ch))
 }
 
 func (sh *defaultSignalHandler) RemoveSignal(ch chan<- *Signal) {
@@ -300,29 +297,121 @@ func (sh *defaultSignalHandler) RemoveSignal(ch chan<- *Signal) {
 type signalChannelData struct {
 	wg   sync.WaitGroup
 	ch   chan<- *Signal
+	pipe chan *Signal // pipe to deliverRoutine
 	done chan struct{}
+	q    *signalQueue
+}
+
+func newSignalChannelData(ch chan<- *Signal) *signalChannelData {
+	scd := &signalChannelData{
+		ch:   ch,
+		pipe: make(chan *Signal),
+		done: make(chan struct{}),
+		q:    newSignalQueue(),
+	}
+	scd.wg.Add(1)
+	go scd.deliverRoutine()
+	return scd
 }
 
 func (scd *signalChannelData) deliver(signal *Signal) {
 	select {
-	case scd.ch <- signal:
+	case scd.pipe <- signal:
 	case <-scd.done:
-		return
-	default:
-		scd.wg.Add(1)
-		go scd.deferredDeliver(signal)
 	}
 }
 
-func (scd *signalChannelData) deferredDeliver(signal *Signal) {
-	select {
-	case scd.ch <- signal:
-	case <-scd.done:
+func (scd *signalChannelData) deliverRoutine() {
+	defer scd.wg.Done()
+	for {
+		// Prioritize done.
+		select {
+		case <-scd.done:
+			return
+		default:
+		}
+		if sig, ok := scd.q.Next(); ok {
+			select {
+			case scd.ch <- sig:
+				scd.q.Pop()
+			case rcvSig := <-scd.pipe:
+				scd.q.Push(rcvSig)
+			case <-scd.done:
+				return
+			}
+		} else {
+			select {
+			case rcvSig := <-scd.pipe:
+				scd.q.Push(rcvSig)
+			case <-scd.done:
+				return
+			}
+		}
 	}
-	scd.wg.Done()
 }
 
 func (scd *signalChannelData) close() {
 	close(scd.done)
 	scd.wg.Wait() // wait until all spawned goroutines return
+}
+
+type signalListNode struct {
+	prev, next *signalListNode
+	sig        *Signal
+}
+
+type signalQueue struct {
+	lock  sync.Mutex
+	guard *signalListNode
+}
+
+func newSignalQueue() *signalQueue {
+	node := &signalListNode{}
+	node.prev = node
+	node.next = node
+	return &signalQueue{guard: node}
+}
+
+func (q *signalQueue) Push(sig *Signal) {
+	q.lock.Lock()
+	defer q.lock.Unlock()
+	// Insert after guard.
+	node := &signalListNode{sig: sig}
+	node.prev = q.guard
+	node.next = q.guard.next
+	q.guard.next.prev = node
+	q.guard.next = node
+}
+
+func (q *signalQueue) empty() bool {
+	return q.guard.prev == q.guard
+}
+
+// Pop one element from queue and return the popped element.
+// ok is set to false when the queue is empty.
+func (q *signalQueue) Pop() (s *Signal, ok bool) {
+	q.lock.Lock()
+	defer q.lock.Unlock()
+	if q.empty() {
+		return nil, false
+	}
+	// Pop the one before guard.
+	ret := q.guard.prev
+	ret.next.prev = ret.prev
+	ret.prev.next = ret.next
+	ret.prev = nil
+	ret.next = nil
+	return ret.sig, true
+}
+
+// Next returns the next element to pop in the queue. ok is
+// set to false if the queue is empty.
+func (q *signalQueue) Next() (s *Signal, ok bool) {
+	q.lock.Lock()
+	defer q.lock.Unlock()
+	if q.empty() {
+		return nil, false
+	}
+	// Return the one before guard.
+	return q.guard.prev.sig, true
 }
